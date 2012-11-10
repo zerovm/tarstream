@@ -894,9 +894,9 @@ class TarStream(object):
 
     errors = None
 
-    def __init__(self, tf, path_list, chunk_size=65536,
+    def __init__(self, tar_iter, path_list, chunk_size=65536,
                  format=DEFAULT_FORMAT, encoding=ENCODING):
-        self.tf = tf
+        self.tar_iter = tar_iter
         self.path_list = path_list
         self.chunk_size = chunk_size
         self.format = format
@@ -937,14 +937,10 @@ class TarStream(object):
                 for chunk in self._serve_chunk(nulls):
                     yield chunk
             self.file_len = 0
-        if self.tf:
-            while True:
-                chunk = self.tf.read(self.chunk_size)
-                if chunk:
-                    for chunk in self._serve_chunk(chunk):
-                        yield chunk
-                else:
-                    break
+        if self.tar_iter:
+            for data in self.tar_iter:
+                for chunk in self._serve_chunk(data):
+                    yield chunk
         else:
             for chunk in self._serve_chunk(NUL * (BLOCKSIZE * 2)):
                 yield chunk
@@ -1082,19 +1078,16 @@ if __name__ == "__main__":
 
     if op not in ['cf', 'xf']:
         print 'Usage: tarstream.py cf|xf <tar source> <tar dest> <filtered files>'
-    src_fp = None
+    src_iter = None
     if src not in '-':
-        src_fp = open(src, 'rb')
+        src_iter = RegFile(src, chunk_size)
     dst_fp = open(dst, 'wb')
     if op in 'cf':
         path_list = [RegFile(path, chunk_size) for path in path_list]
-        for data in TarStream(src_fp, path_list, chunk_size):
+        for data in TarStream(src_iter, path_list, chunk_size):
             dst_fp.write(data)
     elif op in 'xf':
         path_list = [open(path, 'wb') for path in path_list]
-        src_iter = RegFile(src, chunk_size)
         for data in UntarStream(src_iter, path_list):
             dst_fp.write(data)
     dst_fp.close()
-    if src_fp:
-        src_fp.close()
