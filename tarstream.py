@@ -514,6 +514,7 @@ class TarInfo(object):
         obj.chksum = chksum
         obj.type = buf[156:157]
         obj.linkname = nts(buf[157:257])
+        obj.magic = buf[257:265]
         obj.uname = nts(buf[265:297])
         obj.gname = nts(buf[297:329])
         obj.devmajor = nti(buf[329:337])
@@ -877,25 +878,42 @@ class RegFile:
             self.type = REGTYPE
 
     def __iter__(self):
-        """
-        """
-        try:
-            self.fp = open(self.file_name, 'rb')
-            while True:
-                chunk = self.fp.read(self.chunk_size)
-                if chunk:
-                    yield chunk
-                else:
-                    break
-        finally:
-            self.fp.close()
+        self.fp = open(self.file_name, 'rb')
+        return self
+
+    def next(self):
+        chunk = self.fp.read(self.chunk_size)
+        if chunk:
+            return chunk
+        else:
+            if self.fp:
+                self.fp.close()
+                self.fp = None
+                raise StopIteration
+
+class StringBuffer:
+
+    def __init__(self, name, body=''):
+        self.name = name
+        self.file_name = name
+        self.size = len(body)
+        self.body = body
+        self.is_closed = False
+        self.type = REGTYPE
+
+    def write(self, data):
+        if not self.is_closed:
+            self.body += data
+
+    def close(self):
+        self.is_closed = True
 
 class TarStream(object):
 
     errors = None
 
-    def __init__(self, tar_iter, path_list, chunk_size=65536,
-                 format=DEFAULT_FORMAT, encoding=ENCODING):
+    def __init__(self, tar_iter=None, path_list=None, chunk_size=65536,
+                 format=DEFAULT_FORMAT, encoding=ENCODING, append=False):
         self.tar_iter = tar_iter
         self.path_list = path_list
         self.chunk_size = chunk_size
@@ -904,6 +922,7 @@ class TarStream(object):
         self.to_write = self.chunk_size
         self.data = ''
         self.file_len = 0
+        self.append = append
 
     def _serve_chunk(self, buf):
         self.to_write -= len(buf)
@@ -916,15 +935,38 @@ class TarStream(object):
         else:
             self.data += buf
 
+    def create_tarinfo(self, path):
+        tarinfo = TarInfo()
+        tarinfo.tarfile = None
+        tarinfo.type = path.type
+        tarinfo.name = path.file_name
+        tarinfo.size = path.size
+        tarinfo.mtime = time.time()
+        buf = tarinfo.tobuf(self.format, self.encoding, self.errors)
+        return buf
+
+    def create_tarinfo(self, type, name, size):
+        tarinfo = TarInfo()
+        tarinfo.tarfile = None
+        tarinfo.type = type
+        tarinfo.name = name
+        tarinfo.size = size
+        tarinfo.mtime = time.time()
+        buf = tarinfo.tobuf(self.format, self.encoding, self.errors)
+        return buf
+
+    def get_archive_size(self, file_size):
+        size = file_size + BLOCKSIZE - 1
+        return (size / BLOCKSIZE) * BLOCKSIZE
+
     def __iter__(self):
+        if self.append:
+            if self.tar_iter:
+                for data in self.tar_iter:
+                    for chunk in self._serve_chunk(data):
+                        yield chunk
         for path in self.path_list:
-            tarinfo = TarInfo()
-            tarinfo.tarfile = None
-            tarinfo.type = path.type
-            tarinfo.name = path.file_name
-            tarinfo.size = path.size
-            tarinfo.mtime = time.time()
-            buf = tarinfo.tobuf(self.format, self.encoding, self.errors)
+            buf = self.create_tarinfo(path)
             for chunk in self._serve_chunk(buf):
                 yield chunk
             for file_data in path:
@@ -937,22 +979,61 @@ class TarStream(object):
                 for chunk in self._serve_chunk(nulls):
                     yield chunk
             self.file_len = 0
-        if self.tar_iter:
-            for data in self.tar_iter:
-                for chunk in self._serve_chunk(data):
+        if not self.append:
+            if self.tar_iter:
+                for data in self.tar_iter:
+                    for chunk in self._serve_chunk(data):
+                        yield chunk
+            else:
+                for chunk in self._serve_chunk(NUL * (BLOCKSIZE * 2)):
                     yield chunk
-        else:
-            for chunk in self._serve_chunk(NUL * (BLOCKSIZE * 2)):
-                yield chunk
         if self.data:
             yield self.data
 
 
+class ExtractedFile(object):
+
+    def __init__(self, untar_stream):
+        self.untar_stream = untar_stream
+        self.data = ''
+
+    def read(self, size=None):
+        if size is None:
+            size = self.untar_stream.to_write
+
+        if size:
+            if self.untar_stream.to_write:
+                while len(self.data) < size:
+                    chunk = self.untar_stream.get_file_chunk()
+                    if not chunk:
+                        result = self.data[:]
+                        self.data = ''
+                        return result
+                    self.data += chunk
+                    if self.untar_stream.to_write:
+                        self.untar_stream.block = ''
+                        try:
+                            data = next(self.untar_stream.tar_iter)
+                        except StopIteration:
+                            result = self.data[:]
+                            self.data = ''
+                            return result
+                        self.untar_stream.update_buffer(data)
+            else:
+                result = self.data[:]
+                self.data = ''
+                return result
+            result = self.data[:size]
+            self.data = self.data[size:]
+            return result
+        return ''
+
+
 class UntarStream(object):
 
-    def __init__(self, tar_iter, path_list, encoding=ENCODING,
+    def __init__(self, tar_iter, path_list=[], encoding=ENCODING,
                  errors=None):
-        self.tar_iter = tar_iter
+        self.tar_iter = iter(tar_iter)
         self.path_list = path_list
         self.block = ''
         self.encoding = encoding
@@ -960,43 +1041,25 @@ class UntarStream(object):
         self.pax_headers = {}
         self.offset = 0
         self.offset_data = 0
-        self.last_offset = 0
         self.to_write = 0
         self.fp = None
+        self.format = None
+
+    def update_buffer(self, data):
+        if self.block:
+            self.block += data
+        else:
+            self.block = data
 
     def __iter__(self):
-        count = -1
-        for data in self.tar_iter:
-            count += 1
-            #print '=== %d == %d ===' % (count, count * 65536)
-            #print [self.last_offset, self.offset, self.offset_data, self.to_write]
-            if self.block:
-                self.block += data
-            else:
-                self.block = data
-            self.to_write = self.write_file()
-            if self.to_write:
-                yield data
-                #print "1 <- %d " % count
-                self.block = None
-                continue
-            yield data
-            #print "2 <- %d " % count
-            while True:
-                try:
-                    self.last_offset = self.offset
-                    info = self.read_tarinfo()
-                except EOFHeaderError:
-                    self.offset += BLOCKSIZE
-                    continue
-                except InvalidHeaderError, e:
-                    if self.offset == 0:
-                        raise ReadError(str(e))
-                    self.offset += BLOCKSIZE
-                    continue
+        while True:
+            try:
+                data = next(self.tar_iter)
+            except StopIteration:
                 break
+            self.update_buffer(data)
+            info = self.get_next_tarinfo()
             while info:
-                #print [self.offset, info.name, info.offset, info.offset_data, info.size]
                 if info.offset_data:
                     for f in self.path_list:
                         if info.name == f.name:
@@ -1004,29 +1067,31 @@ class UntarStream(object):
                             break
                     self.to_write = info.size
                     self.offset_data = info.offset_data
-                    self.to_write = self.write_file()
-                    if self.to_write:
-                        self.block = None
-                        break
-                while True:
-                    try:
-                        self.last_offset = self.offset
-                        info = self.read_tarinfo()
-                    except EOFHeaderError:
-                        self.offset += BLOCKSIZE
-                        continue
-                    except InvalidHeaderError, e:
-                        if self.offset == 0:
-                            raise ReadError(str(e))
-                        self.offset += BLOCKSIZE
-                        continue
-                    break
+                    while self.to_write:
+                        if self.fp:
+                            self.fp.write(self.get_file_chunk())
+                            if not self.to_write:
+                                self.fp.close()
+                                self.fp = None
+                        else:
+                            self.skip_file_chunk()
+                        if self.to_write:
+                            self.block = ''
+                            yield data
+                            try:
+                                data = next(self.tar_iter)
+                            except StopIteration:
+                                break
+                            self.update_buffer(data)
+                info = self.get_next_tarinfo()
+            yield data
 
     def next_block(self, size=BLOCKSIZE):
+        if size > len(self.block):
+            return None
         stop = self.offset + size
-        if stop >= len(self.block):
-            self.block = self.block[self.last_offset:]
-            self.last_offset = 0
+        if stop > len(self.block):
+            self.block = self.block[self.offset:]
             self.offset = 0
             return None
         start = self.offset
@@ -1049,22 +1114,66 @@ class UntarStream(object):
             return tarinfo._proc_builtin(self)
 
     def write_file(self):
-        if not self.to_write:
-            return 0
+        chunk = self.get_file_chunk()
+        if self.fp:
+            self.fp.write(chunk)
+            if not self.to_write:
+                self.fp.close()
+                self.fp = None
+
+    def get_file_chunk(self):
+        buf_size = len(self.block)
+        eof = self.offset_data + self.to_write
+        if eof <= buf_size:
+            self.to_write = 0
+            return self.block[self.offset_data:eof]
+        start = self.offset_data
+        self.offset_data = 0
+        self.offset -= buf_size
+        self.to_write = eof - buf_size
+        return self.block[start:]
+
+    def skip_file_chunk(self):
         buf_size = len(self.block)
         eof = self.offset_data + self.to_write
         if eof < buf_size:
-            if self.fp:
-                self.fp.write(self.block[self.offset_data:eof])
-                self.fp.close()
-                self.fp = None
-            return 0
-        if self.fp:
-            self.fp.write(self.block[self.offset_data:])
+            self.to_write = 0
+            return
         self.offset_data = 0
         self.offset -= buf_size
-        return eof - buf_size
+        self.to_write = eof - buf_size
 
+    def get_next_tarinfo(self):
+        info = None
+        while True:
+            try:
+                info = self.read_tarinfo()
+            except EOFHeaderError:
+                self.offset += BLOCKSIZE
+                continue
+            except InvalidHeaderError, e:
+                if self.offset == 0:
+                    raise ReadError(str(e))
+                self.offset += BLOCKSIZE
+                continue
+            break
+        if info:
+            if info.magic == GNU_MAGIC:
+                self.format = GNU_FORMAT
+            elif info.magic == POSIX_MAGIC:
+                self.format = USTAR_FORMAT
+        return info
+
+    def untar_file_iter(self):
+        while self.to_write:
+            yield self.get_file_chunk()
+            if self.to_write:
+                self.block = ''
+                try:
+                    data = next(self.tar_iter)
+                except StopIteration:
+                    break
+                self.update_buffer(data)
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
