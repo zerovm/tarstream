@@ -861,6 +861,20 @@ class _ringbuffer(list):
         self.idx = idx
         return item
 
+
+class Path:
+
+    def __init__(self, type, file_name, size, data):
+        self.type = type
+        self.file_name = file_name
+        self.size = size
+        self.data = data
+
+    def __iter__(self):
+        for chunk in self.data:
+            yield chunk
+
+
 class RegFile:
 
     def __init__(self, file_name, chunk_size=65536):
@@ -935,22 +949,17 @@ class TarStream(object):
         else:
             self.data += buf
 
-    def create_tarinfo(self, path):
+    def create_tarinfo(self, path=None, ftype=None, name=None, size=None):
         tarinfo = TarInfo()
         tarinfo.tarfile = None
-        tarinfo.type = path.type
-        tarinfo.name = path.file_name
-        tarinfo.size = path.size
-        tarinfo.mtime = time.time()
-        buf = tarinfo.tobuf(self.format, self.encoding, self.errors)
-        return buf
-
-    def create_tarinfo(self, type, name, size):
-        tarinfo = TarInfo()
-        tarinfo.tarfile = None
-        tarinfo.type = type
-        tarinfo.name = name
-        tarinfo.size = size
+        if path:
+            tarinfo.type = path.type
+            tarinfo.name = path.file_name
+            tarinfo.size = path.size
+        else:
+            tarinfo.type = ftype
+            tarinfo.name = name
+            tarinfo.size = size
         tarinfo.mtime = time.time()
         buf = tarinfo.tobuf(self.format, self.encoding, self.errors)
         return buf
@@ -959,6 +968,13 @@ class TarStream(object):
         size = file_size + BLOCKSIZE - 1
         return (size / BLOCKSIZE) * BLOCKSIZE
 
+    def get_total_stream_length(self):
+        size = 0
+        for path in self.path_list:
+            size += self.get_archive_size(path.size)
+            size += len(self.create_tarinfo(path=path))
+        return size
+
     def __iter__(self):
         if self.append:
             if self.tar_iter:
@@ -966,7 +982,7 @@ class TarStream(object):
                     for chunk in self._serve_chunk(data):
                         yield chunk
         for path in self.path_list:
-            buf = self.create_tarinfo(path)
+            buf = self.create_tarinfo(path=path)
             for chunk in self._serve_chunk(buf):
                 yield chunk
             for file_data in path:
